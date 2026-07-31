@@ -1,4 +1,6 @@
 import app
+import power
+
 from app_components.menu import Menu
 from app_components.background import Background as bg
 from events.input import BUTTON_TYPES, ButtonDownEvent
@@ -9,7 +11,7 @@ from system.patterndisplay.events import PatternDisable, PatternEnable
 class PowerApp(app.App):
     def __init__(self):
         super().__init__()
-        # state: "menu", "poweroff", "standby"
+        # state: "menu", "poweroff", "standby", "charging_poweroff"
         self.state = "menu"
         self.screen_blank = False
         self._prev_blank = False
@@ -27,7 +29,7 @@ class PowerApp(app.App):
             back_handler=self._menu_back,
         )
 
-    def _set_hexpansion_low_power(self):
+    def _set_hexpansion_ports_off(self):
         from egpio import ePin
 
         HEXPANSION_POWER = {
@@ -68,10 +70,11 @@ class PowerApp(app.App):
             ePin(nd_pin, ePin.IN)
         tildagonos.set_led_power(True)
 
+    def _is_done_charging(self):
+        return power.BatteryChargeState() in ("Not Charging", "Terminated")
+
     def _get_standby_power_lines(self):
         try:
-            import power
-
             battery_pct = power.BatteryLevel()
             charge_current_ma = power.Icharge() * 1000.0
             charge_state = power.BatteryChargeState()
@@ -85,21 +88,20 @@ class PowerApp(app.App):
 
     def _menu_select(self, item, _idx):
         self.menu._cleanup()
+        eventbus.emit(PatternDisable())
+        self._standby_refresh_elapsed_ms = 0
         if item == "Power Off":
-            import power
-
-            power.Off()
-            self.state = "poweroff"
-            self._force_render = True
-            self._ignore_next_button = True
-            self._set_hexpansion_low_power()
+            self._set_hexpansion_ports_off()
+            if self._is_done_charging():
+                power.Off()
+                self.state = "poweroff"
+            else:
+                self.state = "charging_poweroff"
         else:
+            self._set_hexpansion_ports_off()
             self.state = "standby"
-            self._force_render = True
-            self._ignore_next_button = True
-            self._standby_refresh_elapsed_ms = 0
-            eventbus.emit(PatternDisable())
-            self._set_hexpansion_low_power()
+        self._force_render = True
+        self._ignore_next_button = True
         eventbus.on_async(ButtonDownEvent, self._handle_buttondown, self)
 
     def _menu_back(self):
@@ -110,7 +112,10 @@ class PowerApp(app.App):
         if self._ignore_next_button:
             self._ignore_next_button = False
             return
-        if self.state == "standby" and (
+        if self.state in (
+            "standby",
+            "charging_poweroff",
+        ) and (
             BUTTON_TYPES["CANCEL"] in event.button
             or BUTTON_TYPES["LEFT"] in event.button
         ):
@@ -145,11 +150,19 @@ class PowerApp(app.App):
         if self._prev_blank != self.screen_blank:
             self._prev_blank = self.screen_blank
             return True
-        if self.state == "standby" and not self.screen_blank:
+        if self.state in (
+            "standby",
+            "charging_poweroff",
+        ):
             self._standby_refresh_elapsed_ms += delta
             if self._standby_refresh_elapsed_ms >= self._standby_refresh_interval_ms:
                 self._standby_refresh_elapsed_ms = 0
-                return True
+                if self.state == "charging_poweroff":
+                    if self._is_done_charging():
+                        power.Off()
+                        self.state = "poweroff"
+                if not self.screen_blank:
+                    return True
         return False
 
     def draw(self, ctx):
@@ -167,26 +180,34 @@ class PowerApp(app.App):
                 if self.state == "poweroff":
                     ctx.move_to(0, -50).text("It is now safe to")
                     ctx.move_to(0, -28).text("unplug your badge.")
+                    ctx.move_to(0, 0).text("Battery charged.")
                     ctx.font_size = 16
-                    ctx.rgb(1, 1, 1).move_to(0, -2).text(
+                    ctx.rgb(1, 1, 1).move_to(0, 28).text(
                         "Press any key to blank screen."
                     )
-                    ctx.move_to(0, 16).text("Press again to restore screen.")
-                    ctx.move_to(0, 44).text("Battery does not")
-                    ctx.move_to(0, 62).text("charge in this state.")
-                    ctx.move_to(0, 80).text("Please use Standby.")
+                    ctx.move_to(0, 46).text("Press again to restore screen.")
+                    ctx.move_to(0, 73).text("Unplug from USB")
+                    ctx.move_to(0, 91).text("to power off.")
                 else:
                     battery_line, current_line, state_line = (
                         self._get_standby_power_lines()
                     )
-
-                    ctx.move_to(0, -40).text("Standby")
-                    ctx.font_size = 16
-                    ctx.rgb(1, 1, 1).move_to(0, -14).text(
-                        "Press any key to blank screen."
-                    )
-                    ctx.move_to(0, 4).text("Press again to restore screen.")
-                    ctx.move_to(0, 22).text("Press back to exit standby.")
+                    if self.state == "standby":
+                        ctx.move_to(0, -40).text("Standby")
+                        ctx.font_size = 16
+                        ctx.rgb(1, 1, 1).move_to(0, -14).text(
+                            "Press any key to blank screen."
+                        )
+                        ctx.move_to(0, 4).text("Press again to restore screen.")
+                        ctx.move_to(0, 22).text("Press back to exit standby.")
+                    else:
+                        ctx.move_to(0, -84).text("Charging...")
+                        ctx.font_size = 16
+                        ctx.rgb(1, 1, 1).move_to(0, -58).text("Will power off when")
+                        ctx.move_to(0, -41).text("charging stops.")
+                        ctx.move_to(0, -18).text("Press back to cancel.")
+                        ctx.move_to(0, 5).text("Press any key to blank screen.")
+                        ctx.move_to(0, 22).text("Press again to restore screen.")
                     ctx.move_to(0, 46).text(battery_line)
                     ctx.move_to(0, 64).text(current_line)
                     ctx.move_to(0, 82).text(state_line)
